@@ -26,6 +26,7 @@ from src.main import AgentWorker
 
 CHAIN_FILE = "orynq_audit_chain.json"
 CHAIN_TMP_FILE = CHAIN_FILE + ".tmp"   # write-ahead journal, see background.py
+ZERO_HASH = "0" * 64                   # genesis prev-hash
 MATERIOS_GATEWAY_URL = "https://materios.fluxpointstudios.com/blobs"
 MATERIOS_GATEWAY_API_KEY = ""  # Optional — enables sponsored receipt submission
 
@@ -48,6 +49,70 @@ VOICE_STYLE = (
 
 def _canonical_json(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
+
+
+def _hash_str(data: str) -> str:
+    return hashlib.sha256(data.encode("utf-8")).hexdigest()
+
+
+def _is_compacted_head(entry) -> bool:
+    """True if entry is a synthetic compacted-head marker (see background.py)."""
+    return isinstance(entry, dict) and entry.get("type") == "compacted_head"
+
+
+def _split_chain(chain: list):
+    """Separate the compacted_head marker (if any) from real hash entries.
+
+    Returns `(marker_or_None, real_entries)`. The on-disk chain may begin
+    with a synthetic marker record when the background daemon has
+    compacted older history to stay under MAX_ENTRIES_ON_DISK; the
+    marker is not itself a hash entry and must be stripped before most
+    downstream operations (verification, upload envelope, seq counting).
+    """
+    if chain and _is_compacted_head(chain[0]):
+        return chain[0], chain[1:]
+    return None, list(chain or [])
+
+
+def _verify_chain(chain: list) -> dict:
+    """Replay every hash link in the on-disk chain.
+
+    Returns `{"ok": bool, "checked": int, "error": str|None, "partial":
+    bool}`. `partial` is True when history was compacted — replay starts
+    from the compacted_head's `prev_head` rather than genesis, so a
+    successful verify only proves the chain is consistent from the
+    compaction point forward.
+    """
+    marker, entries = _split_chain(chain)
+    partial = marker is not None
+    expected_prev = marker.get("prev_head", ZERO_HASH) if marker else ZERO_HASH
+
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            return {"ok": False, "checked": i, "error": "non-dict entry",
+                    "partial": partial}
+        prev = entry.get("previous_hash")
+        if prev != expected_prev:
+            return {"ok": False, "checked": i,
+                    "error": "previous_hash mismatch at index " + str(i),
+                    "partial": partial}
+        # Recompute the canonical payload hash and compare.
+        payload = {
+            "seq": entry.get("seq"),
+            "role": entry.get("role"),
+            "content_hash": entry.get("content_hash"),
+            "prev": prev,
+            "ts": entry.get("timestamp"),
+        }
+        recomputed = _hash_str(_canonical_json(payload))
+        if recomputed != entry.get("chain_hash"):
+            return {"ok": False, "checked": i,
+                    "error": "chain_hash mismatch at index " + str(i),
+                    "partial": partial}
+        expected_prev = entry["chain_hash"]
+
+    return {"ok": True, "checked": len(entries), "error": None,
+            "partial": partial}
 
 
 class OrynqAuditabilityCapability(MatchingCapability):
@@ -220,15 +285,25 @@ class OrynqAuditabilityCapability(MatchingCapability):
         """
         Wire format: {p:"materios", v:2, chain:[...], head:"<hex>"}
         Shape is kept stable on purpose — this is the schema the cert
-        daemon committee already indexes under Cardano metadata label 8746.
+        daemon committee already indexes under Cardano metadata label
+        8746. The in-memory chain can begin with a synthetic
+        `compacted_head` marker (rolling-window compaction), which is
+        NOT a hash entry and would confuse v2 indexers, so we strip it
+        out of `chain` and surface it as an optional additive top-level
+        field. v2-only consumers ignore the extra field; compaction-
+        aware consumers use it to know that replay from genesis is not
+        possible for this blob.
         """
-        head = chain[-1]["chain_hash"] if chain else "0" * 64
+        marker, real_entries = _split_chain(chain)
+        head = real_entries[-1]["chain_hash"] if real_entries else ZERO_HASH
         envelope = {
             "p": "materios",
             "v": 2,
-            "chain": chain,
+            "chain": real_entries,
             "head": head,
         }
+        if marker is not None:
+            envelope["compacted_head"] = marker
         return _canonical_json(envelope).encode("utf-8")
 
     def _anchor_to_materios(self, chain: list) -> Optional[dict]:
@@ -343,7 +418,10 @@ class OrynqAuditabilityCapability(MatchingCapability):
 
     async def _do_anchor(self, data: dict) -> bool:
         chain = data.get("chain", []) or []
-        if not chain:
+        # Anchoring is only meaningful if there is at least one real hash
+        # entry — a lone compacted_head marker is metadata, not history.
+        _, real_entries = _split_chain(chain)
+        if not real_entries:
             await self.capability_worker.speak(
                 "Nothing to anchor yet. Try again later."
             )
@@ -378,13 +456,19 @@ class OrynqAuditabilityCapability(MatchingCapability):
                 return
 
             chain = data.get("chain", []) or []
+            # `real_entries` drops the synthetic compacted_head marker
+            # that rolling-window compaction prepends; everything the
+            # user hears is phrased in terms of real entries only. The
+            # spoken summary stays quiet about compaction unless the
+            # user explicitly asks for a verification status.
+            _marker, real_entries = _split_chain(chain)
             head = data.get("head", "")
             last_anchor = data.get("last_anchor")
             consent_until = int(data.get("consent_granted_until", 0) or 0)
             now = int(time.time())
             auto_active = consent_until > now
 
-            if not chain:
+            if not real_entries:
                 await self.capability_worker.speak(
                     "The audit chain is empty. I'll start capturing from now."
                 )
@@ -408,7 +492,7 @@ class OrynqAuditabilityCapability(MatchingCapability):
 
             # Otherwise summarize + open-ended question, then classify reply.
             await self.capability_worker.speak(
-                self._summarize_state(len(chain), head, last_anchor, auto_active)
+                self._summarize_state(len(real_entries), head, last_anchor, auto_active)
             )
             reply = await self.capability_worker.user_response()
             intent = self._classify_intent(reply or "")
@@ -436,11 +520,30 @@ class OrynqAuditabilityCapability(MatchingCapability):
                 return
 
             if intent == "VERIFY":
+                # Actually replay the hash chain. When history has been
+                # compacted, verification starts from the compacted_head
+                # `prev_head` rather than genesis — the user is told the
+                # history is partial only in this explicit-ask path, per
+                # the "don't mention compaction unless asked" rule.
+                result = _verify_chain(chain)
                 short = head[:12] if head else "empty"
-                await self.capability_worker.speak(
-                    "Local chain is " + str(len(chain))
-                    + " entries, head " + short + "."
-                )
+                if result["ok"]:
+                    if result["partial"]:
+                        await self.capability_worker.speak(
+                            "Verified " + str(result["checked"])
+                            + " entries, head " + short
+                            + ". Older history has been compacted."
+                        )
+                    else:
+                        await self.capability_worker.speak(
+                            "Verified " + str(result["checked"])
+                            + " entries, head " + short + "."
+                        )
+                else:
+                    await self.capability_worker.speak(
+                        "Chain failed verification at entry "
+                        + str(result["checked"]) + "."
+                    )
                 return
 
             if intent == "REVOKE":

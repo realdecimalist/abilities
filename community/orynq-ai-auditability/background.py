@@ -31,6 +31,15 @@ POLL_INTERVAL = 90.0            # seconds between polls (reviewer suggested 60-9
 SAVE_EVERY_N_POLLS = 10         # flush to disk at least every N polls even if nothing changed
 ZERO_HASH = "0" * 64            # genesis prev-hash
 
+# Rolling-window cap for on-disk history. When the number of real entries
+# exceeds this, we compact by dropping the oldest entries and prepending a
+# synthetic `compacted_head` marker so the chain stays linkable. The head
+# hash is unchanged because every retained entry's `previous_hash` still
+# chains backward correctly; only the ability to replay from genesis is
+# lost. 10000 entries at ~400 bytes per entry ≈ 4 MB on disk, which covers
+# many sessions of dense use before any compaction fires.
+MAX_ENTRIES_ON_DISK = 10000
+
 
 def _canonical_json(obj) -> str:
     """Deterministic JSON encoding used for hash inputs."""
@@ -77,6 +86,49 @@ def _build_entry(role: str, content: str, prev: str, seq: int) -> dict:
         "previous_hash": prev,
         "timestamp": timestamp,
     }
+
+
+def _is_compacted_head(entry) -> bool:
+    """True if entry is a synthetic compacted-head marker, not a real hash entry."""
+    return isinstance(entry, dict) and entry.get("type") == "compacted_head"
+
+
+def _compact_if_needed(state: dict) -> None:
+    """Enforce MAX_ENTRIES_ON_DISK by prepending a synthetic compacted_head.
+
+    Mutates `state["chain"]` in place. The chain head (state["head"]) is
+    unchanged — every retained entry's `previous_hash` still chains
+    backward correctly; only the ability to replay from genesis is lost.
+    The compacted_head record preserves the hash of the last discarded
+    entry so external verifiers can confirm continuity from the
+    compaction point forward.
+    """
+    chain = state.get("chain", []) or []
+    # Only real entries count against the cap; an existing compacted_head
+    # marker from a previous compaction sits at index 0 and is free.
+    has_marker = bool(chain) and _is_compacted_head(chain[0])
+    real_count = len(chain) - (1 if has_marker else 0)
+    if real_count <= MAX_ENTRIES_ON_DISK:
+        return
+
+    real_entries = chain[1:] if has_marker else chain
+    keep = real_entries[-MAX_ENTRIES_ON_DISK:]
+    dropped = real_entries[:-MAX_ENTRIES_ON_DISK]
+
+    # prev_head is the chain_hash of the last discarded entry — which is
+    # exactly what keep[0]["previous_hash"] already points to.
+    prev_head = dropped[-1]["chain_hash"] if dropped else ZERO_HASH
+
+    # Accumulate across prior compactions.
+    prior_compacted = int(chain[0].get("entries_compacted", 0)) if has_marker else 0
+
+    marker = {
+        "type": "compacted_head",
+        "prev_head": prev_head,
+        "entries_compacted": prior_compacted + len(dropped),
+        "compacted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    state["chain"] = [marker] + keep
 
 
 class OrynqAuditabilityBackground(MatchingCapability):
@@ -194,6 +246,9 @@ class OrynqAuditabilityBackground(MatchingCapability):
         crash mid-save leaves the journal (which `_load_state` uses to
         recover) rather than destroying the whole chain.
         """
+        # Enforce the rolling-window cap before writing anything.
+        _compact_if_needed(state)
+
         data = {
             "last_seen_index": state["last_seen_index"],
             "chain": state["chain"],
@@ -247,6 +302,17 @@ class OrynqAuditabilityBackground(MatchingCapability):
     def _extend_chain(self, state: dict, new_messages: list) -> int:
         """Append hash entries for each new message. Returns number appended."""
         added = 0
+        # Determine the next sequence number. Using len(chain) would
+        # collide with existing seqs once compaction has prepended a
+        # synthetic marker or trimmed older entries, so we walk backward
+        # to find the highest real seq and continue from there.
+        next_seq = 0
+        for existing in reversed(state["chain"]):
+            if _is_compacted_head(existing):
+                continue
+            next_seq = int(existing.get("seq", -1)) + 1
+            break
+
         for msg in new_messages:
             role = msg.get("role", "")
             content = msg.get("content", "")
@@ -260,10 +326,10 @@ class OrynqAuditabilityBackground(MatchingCapability):
             if role not in ("user", "assistant", "system"):
                 continue
 
-            seq = len(state["chain"])
-            entry = _build_entry(role, content, state["head"], seq)
+            entry = _build_entry(role, content, state["head"], next_seq)
             state["chain"].append(entry)
             state["head"] = entry["chain_hash"]
+            next_seq += 1
             added += 1
         return added
 
