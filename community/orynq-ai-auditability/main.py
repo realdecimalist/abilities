@@ -25,6 +25,7 @@ from src.main import AgentWorker
 # =============================================================================
 
 CHAIN_FILE = "orynq_audit_chain.json"
+CHAIN_TMP_FILE = CHAIN_FILE + ".tmp"   # write-ahead journal, see background.py
 MATERIOS_GATEWAY_URL = "https://materios.fluxpointstudios.com/blobs"
 MATERIOS_GATEWAY_API_KEY = ""  # Optional — enables sponsored receipt submission
 
@@ -58,29 +59,90 @@ class OrynqAuditabilityCapability(MatchingCapability):
 
     # ------------------------------------------------------------------
     # File I/O — reads the chain file written by background.py
+    #
+    # The OpenHome SDK has no atomic rename primitive (see background.py
+    # for the full rationale), so persistence uses the same write-ahead
+    # journal pattern: stage to `.tmp`, verify, overwrite real, delete
+    # `.tmp`. On load, if the real file is missing/corrupt but `.tmp` is
+    # valid, recover from the journal.
     # ------------------------------------------------------------------
 
-    async def _load_chain(self) -> Optional[dict]:
+    async def _read_json_file(self, filename: str) -> Optional[dict]:
+        """Return parsed JSON from filename, or None on any error."""
         try:
-            exists = await self.capability_worker.check_if_file_exists(CHAIN_FILE, False)
+            exists = await self.capability_worker.check_if_file_exists(filename, False)
             if not exists:
                 return None
-            raw = await self.capability_worker.read_file(CHAIN_FILE, False)
+            raw = await self.capability_worker.read_file(filename, False)
             if not raw or not raw.strip():
                 return None
             return json.loads(raw)
+        except Exception:
+            return None
+
+    async def _load_chain(self) -> Optional[dict]:
+        try:
+            data = await self._read_json_file(CHAIN_FILE)
+            tmp_data = await self._read_json_file(CHAIN_TMP_FILE)
+
+            if data is None and tmp_data is not None:
+                # Recover from the journal — real file was lost mid-save.
+                self._log_info("recovered chain from " + CHAIN_TMP_FILE)
+                data = tmp_data
+                try:
+                    await self.capability_worker.write_file(
+                        CHAIN_FILE, json.dumps(data, indent=2), False, mode="w"
+                    )
+                    if await self.capability_worker.check_if_file_exists(
+                        CHAIN_TMP_FILE, False
+                    ):
+                        await self.capability_worker.delete_file(CHAIN_TMP_FILE, False)
+                except Exception as promo_err:
+                    self._log_error("tmp promotion failed: " + str(promo_err))
+            elif data is not None and tmp_data is not None:
+                # Stale journal — real file is authoritative.
+                try:
+                    await self.capability_worker.delete_file(CHAIN_TMP_FILE, False)
+                except Exception:
+                    pass
+
+            return data
         except Exception as e:
             self._log_error("load error: " + str(e))
             return None
 
     async def _save_chain(self, data: dict):
+        """Write-ahead journal save — see background.py for the rationale."""
         try:
-            exists = await self.capability_worker.check_if_file_exists(CHAIN_FILE, False)
-            if exists:
+            serialized = json.dumps(data, indent=2)
+
+            # Step 1: stage to journal.
+            if await self.capability_worker.check_if_file_exists(CHAIN_TMP_FILE, False):
+                await self.capability_worker.delete_file(CHAIN_TMP_FILE, False)
+            await self.capability_worker.write_file(
+                CHAIN_TMP_FILE, serialized, False, mode="w"
+            )
+
+            # Step 2: verify round-trip before touching the real file.
+            verify_raw = await self.capability_worker.read_file(CHAIN_TMP_FILE, False)
+            if not verify_raw or len(verify_raw) != len(serialized):
+                raise IOError(
+                    "journal verify failed (expected "
+                    + str(len(serialized)) + " bytes, got "
+                    + str(len(verify_raw) if verify_raw else 0) + ")"
+                )
+            json.loads(verify_raw)
+
+            # Step 3: overwrite the real file.
+            if await self.capability_worker.check_if_file_exists(CHAIN_FILE, False):
                 await self.capability_worker.delete_file(CHAIN_FILE, False)
             await self.capability_worker.write_file(
-                CHAIN_FILE, json.dumps(data, indent=2), False
+                CHAIN_FILE, serialized, False, mode="w"
             )
+
+            # Step 4: clean up the journal.
+            if await self.capability_worker.check_if_file_exists(CHAIN_TMP_FILE, False):
+                await self.capability_worker.delete_file(CHAIN_TMP_FILE, False)
         except Exception as e:
             self._log_error("save error: " + str(e))
 
