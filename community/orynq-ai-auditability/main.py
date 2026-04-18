@@ -32,6 +32,18 @@ MATERIOS_GATEWAY_API_KEY = ""  # Optional — enables sponsored receipt submissi
 CONSENT_HOUR = 3600
 CONSENT_DAY = 86400
 
+# Shared system prompt used on every LLM call whose output is spoken. Keeps
+# the model from emitting markdown, lists, URLs, emojis, or stage directions,
+# and caps the response length so it sounds like a person on a speaker, not
+# a help page being read aloud.
+VOICE_STYLE = (
+    "You speak on a voice device to a native US English speaker. "
+    "Plain conversational spoken English only. "
+    "No markdown, no bullet points, no numbered lists, no URLs, no emojis, "
+    "no stage directions. "
+    "Keep your reply to at most two sentences and under twenty words total."
+)
+
 
 def _canonical_json(obj) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"))
@@ -102,12 +114,14 @@ class OrynqAuditabilityCapability(MatchingCapability):
         if not text or not text.strip():
             return "UNKNOWN"
 
+        # This one is NOT VOICE_STYLE — output isn't spoken, it's a single
+        # label that the code parses. Still instructs the model to emit one
+        # token only so we don't fall back to UNKNOWN.
         system_prompt = (
             "You are an intent classifier for a voice ability that builds "
-            "tamper-proof audit trails of AI conversations. The user has just "
-            "spoken a reply to a question about anchoring the audit trail to "
-            "the blockchain. Classify their intent into exactly one label. "
-            "Respond with only the label, nothing else."
+            "tamper-proof audit trails of AI conversations. Classify the "
+            "user's reply into exactly one of the listed labels. "
+            "Respond with only the label word, nothing else."
         )
         prompt = (
             "User said: \"" + text.strip() + "\"\n\n"
@@ -222,62 +236,44 @@ class OrynqAuditabilityCapability(MatchingCapability):
             last_txt = "hash " + str(last_anchor.get("content_hash", ""))[:12]
         auto_txt = "auto anchoring is on" if auto_active else "auto anchoring is off"
 
-        system_prompt = (
-            "You speak on a voice device to a native US English speaker. "
-            "Use plain conversational spoken English. No markdown, no bullet "
-            "points, no URLs, no emojis, no stage directions. Keep it under "
-            "twenty five words and at most two sentences."
-        )
         prompt = (
-            "Summarise the audit state and offer to anchor it. "
-            "There are " + str(chain_len) + " entries in the hash chain. "
-            "The chain head starts with " + short + ". "
+            "Summarise the audit state and end with a short open question. "
+            "Chain length: " + str(chain_len) + " entries. "
+            "Head starts with: " + short + ". "
             "Last anchor: " + last_txt + ". "
-            + auto_txt + ". "
-            "End with a short open question asking what the user wants to do."
+            + auto_txt + "."
         )
         try:
             return self.capability_worker.text_to_text_response(
-                prompt, system_prompt=system_prompt
+                prompt, system_prompt=VOICE_STYLE
             )
         except Exception:
             return (
-                "I've captured " + str(chain_len) + " entries so far. "
-                "Want me to anchor the chain to the blockchain now?"
+                "Captured " + str(chain_len) + " entries. Anchor now?"
             )
 
     def _summarize_anchor(self, result: dict) -> str:
         ch = str(result.get("content_hash", ""))[:12]
         sponsored = bool(result.get("sponsored"))
-        system_prompt = (
-            "You speak on a voice device. Plain spoken English, no markdown, "
-            "no URLs, no emojis. One sentence, under twenty words."
-        )
         if sponsored:
             prompt = (
-                "Confirm the audit trail was uploaded and the receipt will be "
-                "batched into Cardano. The content hash starts with " + ch + "."
+                "Confirm the audit trail was uploaded and will be batched "
+                "into Cardano. The content hash starts with " + ch + "."
             )
         else:
             prompt = (
-                "Confirm the audit trail was uploaded. The content hash starts "
-                "with " + ch + ". Mention the user can complete on-chain "
-                "submission later with their own wallet."
+                "Confirm the audit trail was uploaded. Content hash starts "
+                "with " + ch + ". Mention on-chain submission can be "
+                "completed later with their own wallet."
             )
         try:
             return self.capability_worker.text_to_text_response(
-                prompt, system_prompt=system_prompt
+                prompt, system_prompt=VOICE_STYLE
             )
         except Exception:
             if sponsored:
-                return (
-                    "Uploaded. Content hash " + ch
-                    + ". It will be anchored to Cardano."
-                )
-            return (
-                "Uploaded. Content hash " + ch
-                + ". You can finish on-chain submission later."
-            )
+                return "Uploaded, hash " + ch + ". It will be anchored to Cardano."
+            return "Uploaded, hash " + ch + ". Finish on-chain submission later."
 
     # ------------------------------------------------------------------
     # Anchor flow — performs the upload and persists the last-anchor record
@@ -287,7 +283,7 @@ class OrynqAuditabilityCapability(MatchingCapability):
         chain = data.get("chain", []) or []
         if not chain:
             await self.capability_worker.speak(
-                "Nothing to anchor yet. I'll keep capturing and you can try again later."
+                "Nothing to anchor yet. Try again later."
             )
             return False
 
@@ -295,7 +291,7 @@ class OrynqAuditabilityCapability(MatchingCapability):
         result = self._anchor_to_materios(chain)
         if not result:
             await self.capability_worker.speak(
-                "I couldn't reach the gateway. The local chain is still valid."
+                "Couldn't reach the gateway. Local chain is still valid."
             )
             return False
 
@@ -315,8 +311,7 @@ class OrynqAuditabilityCapability(MatchingCapability):
             data = await self._load_chain()
             if not data:
                 await self.capability_worker.speak(
-                    "I haven't captured anything yet. "
-                    "Keep chatting and ask again in a minute."
+                    "Nothing captured yet. Try again in a minute."
                 )
                 return
 
@@ -398,11 +393,9 @@ class OrynqAuditabilityCapability(MatchingCapability):
                 )
                 return
 
-            # Unknown — fall back on a clarifying open question. One round only
-            # (no menu-driven loop).
+            # Unknown — one clarifying open question. No menu-driven loop.
             await self.capability_worker.speak(
-                "Do you want me to anchor the chain to the blockchain, "
-                "or just leave it local?"
+                "Should I anchor it, or leave it local?"
             )
             reply2 = await self.capability_worker.user_response()
             intent2 = self._classify_intent(reply2 or "")
