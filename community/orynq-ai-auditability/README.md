@@ -40,23 +40,20 @@ For blockchain anchoring (optional):
 
 ## How It Works
 
-1. Trigger with a phrase like "audit my AI" or "run orynq"
-2. Speak the messages you want in the audit trail
-3. Say "done" when finished
-4. The ability builds a SHA-256 rolling hash chain — **this is already tamper-proof locally**
-5. You're asked if you want to also anchor it to the blockchain
-6. If yes: the trace is uploaded to the Materios blob gateway, certified by 10 independent attestors, and batched into a Cardano mainnet anchor transaction
+The ability is split in two — passive capture plus on-demand anchoring:
+
+1. **Background daemon (`background.py`)** — starts silently on session connect and polls `get_full_message_history()` every 90 seconds. Every new user or assistant turn is hashed into a rolling SHA-256 chain (`h_i = SHA256(canonical_json({ seq, role, content_hash, prev, ts }))`) and the chain is persisted to user-data file storage (`orynq_audit_chain.json`). Raw content is never stored or uploaded — only the per-message SHA-256 and the chain links.
+2. **Trigger handler (`main.py`)** — when the user says a trigger phrase, the ability reads the persisted chain, briefly reports the length and current head, and asks in natural spoken English whether to anchor. An LLM classifies the reply so the user can say anything ("go ahead", "just tell me where we're at", "leave it local for now", "anchor for the next hour", etc.).
+3. **Consent flow** — by default consent is per-anchor. The user can also grant a time-limited standing consent ("anchor automatically for the next hour" or "for the next day"), which is persisted as `consent_granted_until`. If active, subsequent triggers anchor silently until the TTL expires; revocation is just another voice command.
+4. **Upload** — on consent, the canonical chain is serialised as the v2 Materios envelope (`{p:"materios", v:2, chain:[...], head:"<hex>"}`) and uploaded to `https://materios.fluxpointstudios.com/blobs` using the standard two-step manifest-then-chunk protocol. The cert daemon committee certifies availability and the receipt is batched into a Cardano mainnet transaction under metadata label `8746`.
 
 ## Example Conversation
 
-> **User:** "Audit this conversation"
-> **AI:** "I will create a tamper-proof audit trail. Tell me what to include."
-> **User:** "The model recommended treatment plan A for patient 42"
-> **AI:** "Got it. Say more to add entries, or say done when finished."
-> **User:** "Done"
-> **AI:** "Built a 1-entry hash chain. Anchor hash: 3f8a... This is already tamper-proof locally. Would you also like to anchor it to the blockchain?"
-> **User:** "Yes"
-> **AI:** "Your audit trail was uploaded to Materios. The committee will certify it and batch it into a Cardano mainnet transaction automatically."
+> **(background daemon has been running silently, hashing every turn since session start)**
+> **User:** "Run orynq"
+> **AI:** "I've captured eighteen entries so far, head 3f8a20c1b4ee. Last anchor was about an hour ago. Want me to anchor what's new?"
+> **User:** "Yeah, and just keep anchoring for the next hour."
+> **AI:** "Uploading now." *(short pause)* "Uploaded. Content hash 9c1dab72f340. I'll keep anchoring for the next hour."
 
 ## Why Auditability Matters
 
@@ -69,8 +66,13 @@ As AI systems make increasingly consequential decisions, organizations need prov
 
 ## Technical Details
 
+- **Architecture**: background daemon (`background.py`) for passive capture + interactive trigger (`main.py`) for anchoring
+- **Poll interval**: 90 seconds, configurable (`POLL_INTERVAL` in `background.py`)
 - **Hash algorithm**: SHA-256 rolling chain (each entry includes the previous hash)
-- **Local artifact**: Always created, zero dependencies
+- **Privacy**: only SHA-256 hashes are persisted or uploaded — raw content never leaves the device
+- **Persistence**: `orynq_audit_chain.json` in user-data file storage (survives session restarts)
+- **Consent**: per-anchor by default; optional time-limited standing consent persisted as `consent_granted_until`
+- **Wire format**: v2 Materios envelope — `{p:"materios", v:2, chain:[...], head:"<hex>"}`
 - **Blockchain**: Cardano mainnet via [Materios](https://docs.fluxpointstudios.com/materios-partner-chain) batched anchoring (metadata label `8746`)
 - **Committee**: 10 independent attestors verify data availability before certification
 - **Explorer**: [materios.fluxpointstudios.com/explorer](https://materios.fluxpointstudios.com/explorer/)
